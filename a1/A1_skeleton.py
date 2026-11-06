@@ -1,4 +1,7 @@
 
+from base64 import encode
+
+
 import torch, pickle
 from torch import nn
 from collections import Counter
@@ -21,7 +24,7 @@ import sys, time, os
 # merge means joining such a pair to make one longer token.
 #
 # Training BPE:
-#   1. Split every line of the training text into individual UTF-8 bytes.
+#   1. Split every file of the training text into individual UTF-8 bytes.
 #   2. Start the vocabulary with the four special tokens and all 256 possible
 #      byte values. The vocabulary maps each token to an integer ID.
 #   3. Count how often each pair of neighboring tokens occurs.
@@ -38,11 +41,12 @@ import sys, time, os
 #   4. Replace the resulting tokens with their vocabulary IDs.
 #   5. Add BOS/EOS IDs, and optionally truncate or pad the sequence.
 #
-# This simple version treats a whole non-empty line as one sequence. Therefore,
+# This simple version treats a whole non-empty file as one sequence. Therefore,
 # it may learn tokens that contain spaces or parts of more than one word.
 
 def split_into_bytes(text):
-    """Split a string into individual UTF-8 byte tokens.
+    """Split a string into individual UTF-8 byte tokens.    
+
 
     Args:
         text: The input string to encode.
@@ -51,6 +55,15 @@ def split_into_bytes(text):
         A list containing one ``bytes`` object for each byte in the text.
     """
     ...
+    bytes_list = []
+    stripped = text.strip()
+    bytes_stripped = bytes(stripped, 'utf-8') # b'text'
+    limit = len(bytes_stripped)
+    for i in range(limit):
+        bytes_list.append(bytes([bytes_stripped[i]])) # bytes_stripped[i] returns an int and bytes(int) returns byte encoding
+    return bytes_list
+
+
 
 def build_tokenizer(train_file, max_voc_size=None, model_max_length=None,
                     pad_token='<PAD>', unk_token='<UNK>', bos_token='<BOS>', eos_token='<EOS>'):
@@ -66,17 +79,103 @@ def build_tokenizer(train_file, max_voc_size=None, model_max_length=None,
              eos_token:         The dummy string corresponding to the end the text.
     """
 
+
+    vocabulary = {}
+
+    for byte_value in range(256):
+        vocabulary[bytes([byte_value])] = byte_value
+
+    vocabulary[pad_token] = 256
+    vocabulary[unk_token] = 257
+    vocabulary[bos_token] = 258
+    vocabulary[eos_token] = 259
+
+
+    sequences = []
+
+    
+    with open(train_file, "r", encoding="utf-8") as file:
+        text = file.read()
+        text_len = len(text)
+        sequences = [
+        split_into_bytes(line)
+        for line in text.splitlines()
+        if line.strip()
+        ]
+
+    merge_rules = []
+
+    while len(vocabulary) < max_voc_size:
+        pair_counts = Counter()
+
+        for sequence in sequences:
+            for i in range(len(sequence) - 1):
+                pair = (sequence[i], sequence[i + 1])
+                pair_counts[pair] += 1
+
+        if not pair_counts:
+            break
+
+        most_common_pair, count = pair_counts.most_common(1)[0]
+        merged_token = most_common_pair[0] + most_common_pair[1]
+
+        vocabulary[merged_token] = len(vocabulary)
+        merge_rules.append(most_common_pair)
+
+
+        new_sequences = []
+
+        for sequence in sequences:
+            new_sequence = []
+            i = 0
+
+            while i < len(sequence):
+                if (i + 1 < len(sequence)
+                    and (sequence[i], sequence[i + 1])
+                    == most_common_pair):
+                    new_sequence.append(merged_token)
+                    i += 2
+                else:
+                    new_sequence.append(sequence[i])
+                    i += 1
+
+            new_sequences.append(new_sequence)
+
+        sequences = new_sequences
+
+
+    inverse_vocabulary = {
+        token_id: token
+        for token, token_id in vocabulary.items()
+    }
+
+    return A1Tokenizer(
+    vocabulary,
+    inverse_vocabulary,
+    merge_rules,
+    model_max_length,
+    pad_token,
+    unk_token,
+    bos_token,
+    eos_token)
+
     # TODO: build the vocabulary, using a byte-level BPE tokenization (explained above)
     # Then return a tokenizer object (implemented below).
-    ...
 
 class A1Tokenizer:
     """A minimal implementation of a tokenizer similar to tokenizers in the HuggingFace library."""
 
-    def __init__(self, SOMETHING):
-        # TODO: store all values you need in order to implement __call__ below.
-        self.pad_token_id = ...     # Compulsory attribute.
-        self.model_max_length = ... # Needed for truncation.
+
+    def __init__(self, vocabulary, inverse_vocabulary, merge_rules, model_max_length=None,
+                 pad_token="<PAD>",unk_token="<UNK>", bos_token="<BOS>", eos_token="<EOS>"):
+        self.vocabulary = vocabulary
+        self.inverse_vocabulary = inverse_vocabulary
+        self.merge_rules = merge_rules
+        self.model_max_length = model_max_length
+        self.pad_token_id = vocabulary[pad_token]
+        self.unk_token_id = vocabulary[unk_token]
+        self.bos_token_id = vocabulary[bos_token]
+        self.eos_token_id = vocabulary[eos_token]
 
     def __call__(self, texts, truncation=False, padding=False, return_tensors=None):
         """Tokenize the given texts and return a BatchEncoding containing the integer-encoded tokens.
@@ -102,21 +201,73 @@ class A1Tokenizer:
         #   tokens on the right side.
         # - If `return_tensors` is undefined, then the returned `input_ids` should be a list of lists.
         #   Otherwise, if `return_tensors` is 'pt', then `input_ids` should be a PyTorch 2D tensor.
+        if isinstance(texts, str):
+           texts = [texts]
+
+        int_sequences = []
+
+        # Token replacement logic using saved merge rules.
+        for text in texts:
+            tokens = split_into_bytes(text)
+
+            for pair in self.merge_rules:
+                merged = pair[0] + pair[1]
+                new_tokens = []
+                i = 0
+
+                while i < len(tokens):
+                    if (
+                        i + 1 < len(tokens)
+                        and (tokens[i], tokens[i + 1]) == pair
+                    ):
+                        new_tokens.append(merged)
+                        i += 2
+                    else:
+                        new_tokens.append(tokens[i])
+                        i += 1
+
+                tokens = new_tokens
+
+            ids = [self.vocabulary[token] for token in tokens]
+            ids = [self.bos_token_id] + ids + [self.eos_token_id] # Add beginning and end symbols.
+
+            if truncation and len(ids) > self.model_max_length:
+                ids = ids[:self.model_max_length]
+                ids[-1] = self.eos_token_id
+
+            int_sequences.append(ids)
+
+        if padding:
+            max_length = max(len(ids) for ids in int_sequences)
+
+            for ids in int_sequences:
+                ids.extend(
+                    [self.pad_token_id] * (max_length - len(ids))
+                )
+        # Make 2d pytorch sensor of ints.
+        if return_tensors == "pt":
+            int_sequences = torch.tensor(int_sequences)
+                    
 
         # TODO: Return a BatchEncoding where input_ids stores the result of the integer encoding.
         # Optionally, if you want to be 100% HuggingFace-compatible, you should also include an 
         # attention mask of the same shape as input_ids. In this mask, padding tokens correspond
         # to the the value 0 and real tokens to the value 1.
-        return BatchEncoding({'input_ids': ...})
+
+        return BatchEncoding({"input_ids": int_sequences})
 
     def __len__(self):
         """Return the size of the vocabulary."""
-        return ...
+        return len(self.vocabulary)
 
     def decode(self, ids):
         """Return a string decoded from given input ids"""
-        return ... 
-    
+        return b"".join(
+        self.inverse_vocabulary[i]
+        for i in ids
+        if isinstance(self.inverse_vocabulary[i], bytes) # Do not include one of the 4 special characters, only bytes.
+    ).decode("utf-8")
+        
     def save(self, filename):
         """Save the tokenizer to the given file."""
         with open(filename, 'wb') as f:
